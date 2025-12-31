@@ -1,4 +1,4 @@
-import { Chord, Note } from 'tonal';
+import { Chord } from 'tonal';
 import Pitchfinder from 'pitchfinder';
 
 export interface DetectedChord {
@@ -12,8 +12,11 @@ export interface DetectedChord {
 export interface ChordDetectionResult {
   chords: DetectedChord[];
   duration: number;
-  tempo?: number;
+  key?: string;
 }
+
+// API URL - change this when deployed
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 // Note frequencies for reference (A4 = 440Hz)
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -21,6 +24,7 @@ const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 
 class ChordDetector {
   private audioContext: AudioContext | null = null;
   private detectPitch: ReturnType<typeof Pitchfinder.YIN>;
+  private useBackend: boolean = true; // Try backend first
 
   constructor() {
     this.detectPitch = Pitchfinder.YIN({ sampleRate: 44100 });
@@ -33,14 +37,110 @@ class ChordDetector {
     return this.audioContext;
   }
 
+  /**
+   * Process audio file - tries Python backend first, falls back to JS
+   */
+  async processAudioFile(file: File): Promise<ChordDetectionResult> {
+    // Try Python backend first for better accuracy
+    if (this.useBackend) {
+      try {
+        const result = await this.callBackendAPI(file);
+        console.log('Using Python ML backend for chord detection');
+        return result;
+      } catch (error) {
+        console.warn('Backend unavailable, falling back to JS detection:', error);
+        this.useBackend = false; // Don't try again this session
+      }
+    }
+
+    // Fallback to JavaScript-based detection
+    console.log('Using JavaScript frontend detection');
+    return this.processAudioFileJS(file);
+  }
+
+  /**
+   * Process audio blob - tries Python backend first, falls back to JS
+   */
+  async processAudioBlob(blob: Blob): Promise<ChordDetectionResult> {
+    // Convert blob to file for API
+    const file = new File([blob], 'recording.webm', { type: blob.type });
+    
+    if (this.useBackend) {
+      try {
+        const result = await this.callBackendAPI(file);
+        console.log('Using Python ML backend for chord detection');
+        return result;
+      } catch (error) {
+        console.warn('Backend unavailable, falling back to JS detection:', error);
+        this.useBackend = false;
+      }
+    }
+
+    return this.processAudioBlobJS(blob);
+  }
+
+  /**
+   * Call the Python FastAPI backend
+   */
+  private async callBackendAPI(file: File): Promise<ChordDetectionResult> {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const response = await fetch(`${API_URL}/api/detect-chords`, {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`API error: ${response.status} - ${error}`);
+    }
+
+    const data = await response.json();
+    
+    // Transform API response to match our interface
+    return {
+      chords: data.chords.map((c: any) => ({
+        chord: c.chord,
+        startTime: c.startTime,
+        endTime: c.endTime,
+        confidence: c.confidence || 0.85,
+        notes: c.notes || [],
+      })),
+      duration: data.duration,
+      key: data.key,
+    };
+  }
+
+  // ============== JavaScript Fallback Methods ==============
+
+  private async processAudioFileJS(file: File): Promise<ChordDetectionResult> {
+    const audioContext = this.getAudioContext();
+    const arrayBuffer = await file.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    return this.analyzeAudioBuffer(audioBuffer);
+  }
+
+  private async processAudioBlobJS(blob: Blob): Promise<ChordDetectionResult> {
+    const audioContext = this.getAudioContext();
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    return this.analyzeAudioBuffer(audioBuffer);
+  }
+
+  async processAudioUrl(url: string): Promise<ChordDetectionResult> {
+    const audioContext = this.getAudioContext();
+    const response = await fetch(url);
+    const arrayBuffer = await response.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    return this.analyzeAudioBuffer(audioBuffer);
+  }
+
   private frequencyToNote(frequency: number): string | null {
     if (!frequency || frequency < 20 || frequency > 5000) return null;
-    
-    // Calculate MIDI note number
     const midiNote = Math.round(12 * Math.log2(frequency / 440) + 69);
     const noteIndex = midiNote % 12;
     const octave = Math.floor(midiNote / 12) - 1;
-    
     return `${NOTE_NAMES[noteIndex]}${octave}`;
   }
 
@@ -50,84 +150,33 @@ class ChordDetector {
 
   private detectChordFromNotes(notes: string[]): string {
     if (notes.length === 0) return 'N/C';
-    
-    // Get unique note names without octaves
     const uniqueNotes = [...new Set(notes.map(n => this.noteNameOnly(n)))];
-    
-    if (uniqueNotes.length === 1) {
-      return uniqueNotes[0]; // Single note
-    }
-
-    // Try to detect chord using tonal
+    if (uniqueNotes.length === 1) return uniqueNotes[0];
     const detected = Chord.detect(uniqueNotes);
-    if (detected.length > 0) {
-      return detected[0];
-    }
-
-    // Fallback: return the root note
+    if (detected.length > 0) return detected[0];
     return uniqueNotes[0];
   }
 
-  async processAudioFile(file: File): Promise<ChordDetectionResult> {
-    const audioContext = this.getAudioContext();
-    
-    // Read file as ArrayBuffer
-    const arrayBuffer = await file.arrayBuffer();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-    
-    return this.analyzeAudioBuffer(audioBuffer);
-  }
-
-  async processAudioBlob(blob: Blob): Promise<ChordDetectionResult> {
-    const audioContext = this.getAudioContext();
-    
-    const arrayBuffer = await blob.arrayBuffer();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-    
-    return this.analyzeAudioBuffer(audioBuffer);
-  }
-
-  async processAudioUrl(url: string): Promise<ChordDetectionResult> {
-    const audioContext = this.getAudioContext();
-    
-    const response = await fetch(url);
-    const arrayBuffer = await response.arrayBuffer();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-    
-    return this.analyzeAudioBuffer(audioBuffer);
-  }
-
   private analyzeAudioBuffer(audioBuffer: AudioBuffer): ChordDetectionResult {
-    const channelData = audioBuffer.getChannelData(0); // Get mono channel
+    const channelData = audioBuffer.getChannelData(0);
     const sampleRate = audioBuffer.sampleRate;
     const duration = audioBuffer.duration;
-
-    // Analyze in chunks (every 0.5 seconds for chord detection)
-    const chunkDuration = 0.5; // seconds
+    const chunkDuration = 0.5;
     const chunkSize = Math.floor(sampleRate * chunkDuration);
     const chords: DetectedChord[] = [];
-
     let currentChord: DetectedChord | null = null;
 
     for (let i = 0; i < channelData.length; i += chunkSize) {
       const chunk = channelData.slice(i, i + chunkSize);
       const startTime = i / sampleRate;
       const endTime = Math.min((i + chunkSize) / sampleRate, duration);
-
-      // Detect pitches in this chunk using multiple windows
       const detectedNotes = this.detectNotesInChunk(chunk, sampleRate);
       const chordName = this.detectChordFromNotes(detectedNotes);
 
-      // If same chord continues, extend it
       if (currentChord && currentChord.chord === chordName) {
         currentChord.endTime = endTime;
       } else {
-        // Save previous chord if exists
-        if (currentChord) {
-          chords.push(currentChord);
-        }
-        
-        // Start new chord
+        if (currentChord) chords.push(currentChord);
         currentChord = {
           chord: chordName,
           startTime,
@@ -138,18 +187,8 @@ class ChordDetector {
       }
     }
 
-    // Add last chord
-    if (currentChord) {
-      chords.push(currentChord);
-    }
-
-    // Filter out very short detections and N/C chords at edges
-    const filteredChords = this.postProcessChords(chords);
-
-    return {
-      chords: filteredChords,
-      duration,
-    };
+    if (currentChord) chords.push(currentChord);
+    return { chords: this.postProcessChords(chords), duration };
   }
 
   private detectNotesInChunk(chunk: Float32Array, sampleRate: number): string[] {
@@ -157,28 +196,18 @@ class ChordDetector {
     const windowSize = 2048;
     const hopSize = 512;
 
-    // Use overlapping windows for better detection
     for (let j = 0; j < chunk.length - windowSize; j += hopSize) {
       const window = chunk.slice(j, j + windowSize);
-      
-      // Apply Hanning window
       const windowed = this.applyHanningWindow(window);
-      
-      // Detect pitch
       const frequency = this.detectPitch(windowed);
-      
       if (frequency) {
         const note = this.frequencyToNote(frequency);
-        if (note) {
-          notes.push(note);
-        }
+        if (note) notes.push(note);
       }
     }
 
-    // Also use FFT-based harmonic detection for chord notes
     const harmonicNotes = this.detectHarmonicsFFT(chunk, sampleRate);
     notes.push(...harmonicNotes);
-
     return notes;
   }
 
@@ -194,16 +223,10 @@ class ChordDetector {
   private detectHarmonicsFFT(chunk: Float32Array, sampleRate: number): string[] {
     const notes: string[] = [];
     const fftSize = 4096;
-    
-    // Simple FFT-based peak detection
     if (chunk.length < fftSize) return notes;
 
-    // Calculate energy in frequency bands for each note
     const chromagram = new Array(12).fill(0);
-    
-    // Simple DFT for specific frequencies (simplified approach)
     for (let noteIdx = 0; noteIdx < 12; noteIdx++) {
-      // Check multiple octaves
       for (let octave = 2; octave <= 6; octave++) {
         const freq = 440 * Math.pow(2, (noteIdx - 9 + (octave - 4) * 12) / 12);
         const energy = this.goertzel(chunk, freq, sampleRate);
@@ -211,16 +234,14 @@ class ChordDetector {
       }
     }
 
-    // Find peaks in chromagram
     const maxEnergy = Math.max(...chromagram);
     const threshold = maxEnergy * 0.3;
 
     for (let i = 0; i < 12; i++) {
       if (chromagram[i] > threshold && chromagram[i] > 0.01) {
-        notes.push(NOTE_NAMES[i] + '4'); // Default octave
+        notes.push(NOTE_NAMES[i] + '4');
       }
     }
-
     return notes;
   }
 
@@ -229,7 +250,6 @@ class ChordDetector {
     const w = (2 * Math.PI * k) / samples.length;
     const cosine = Math.cos(w);
     const coeff = 2 * cosine;
-
     let s0 = 0, s1 = 0, s2 = 0;
 
     for (let i = 0; i < samples.length; i++) {
@@ -237,26 +257,20 @@ class ChordDetector {
       s2 = s1;
       s1 = s0;
     }
-
     return Math.sqrt(s1 * s1 + s2 * s2 - coeff * s1 * s2) / samples.length;
   }
 
   private calculateConfidence(notes: string[]): number {
     if (notes.length === 0) return 0;
-    
-    // More notes detected = higher confidence
     const uniqueNotes = new Set(notes.map(n => this.noteNameOnly(n)));
-    
     if (uniqueNotes.size >= 3) return 0.85;
     if (uniqueNotes.size >= 2) return 0.7;
     return 0.5;
   }
 
   private postProcessChords(chords: DetectedChord[]): DetectedChord[] {
-    // Filter out very short chords (< 0.3 seconds)
     let filtered = chords.filter(c => (c.endTime - c.startTime) >= 0.3);
     
-    // Merge adjacent same chords
     const merged: DetectedChord[] = [];
     for (const chord of filtered) {
       const last = merged[merged.length - 1];
@@ -268,7 +282,6 @@ class ChordDetector {
       }
     }
 
-    // Replace N/C with previous chord if surrounded
     for (let i = 1; i < merged.length - 1; i++) {
       if (merged[i].chord === 'N/C') {
         if (merged[i - 1].chord === merged[i + 1].chord) {
@@ -280,9 +293,7 @@ class ChordDetector {
     return merged.filter(c => c.chord !== 'N/C' || (c.endTime - c.startTime) > 1);
   }
 
-  // Get chord for guitar display
   getGuitarChord(chordName: string): { name: string; positions: number[]; fingers: number[] } | null {
-    // Common guitar chord fingerings
     const guitarChords: Record<string, { positions: number[]; fingers: number[] }> = {
       'C': { positions: [-1, 3, 2, 0, 1, 0], fingers: [0, 3, 2, 0, 1, 0] },
       'Cm': { positions: [-1, 3, 5, 5, 4, 3], fingers: [0, 1, 3, 4, 2, 1] },
@@ -303,22 +314,13 @@ class ChordDetector {
       'E7': { positions: [0, 2, 0, 1, 0, 0], fingers: [0, 2, 0, 1, 0, 0] },
       'G7': { positions: [3, 2, 0, 0, 0, 1], fingers: [3, 2, 0, 0, 0, 1] },
       'A7': { positions: [-1, 0, 2, 0, 2, 0], fingers: [0, 0, 1, 0, 2, 0] },
-      'Am7': { positions: [-1, 0, 2, 0, 1, 0], fingers: [0, 0, 2, 0, 1, 0] },
-      'Cmaj7': { positions: [-1, 3, 2, 0, 0, 0], fingers: [0, 3, 2, 0, 0, 0] },
-      'Dmaj7': { positions: [-1, -1, 0, 2, 2, 2], fingers: [0, 0, 0, 1, 1, 1] },
-      'Fmaj7': { positions: [-1, -1, 3, 2, 1, 0], fingers: [0, 0, 3, 2, 1, 0] },
-      'Gmaj7': { positions: [3, 2, 0, 0, 0, 2], fingers: [2, 1, 0, 0, 0, 3] },
     };
 
-    // Normalize chord name
-    const normalizedName = chordName.replace('M', '').replace('maj', 'maj7').trim();
-    
-    // Try exact match first
+    const normalizedName = chordName.replace('M', '').trim();
     if (guitarChords[normalizedName]) {
       return { name: chordName, ...guitarChords[normalizedName] };
     }
 
-    // Try simplified match (just root + quality)
     const root = chordName.match(/^[A-G][#b]?/)?.[0];
     if (root) {
       const isMinor = chordName.toLowerCase().includes('m') && !chordName.toLowerCase().includes('maj');
@@ -327,7 +329,6 @@ class ChordDetector {
         return { name: chordName, ...guitarChords[simpleChord] };
       }
     }
-
     return null;
   }
 
