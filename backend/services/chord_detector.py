@@ -1,77 +1,134 @@
 import os
-import tempfile
-from typing import List, Dict, Any, Tuple
+import sys
+from typing import List, Dict, Any
 import numpy as np
 import librosa
+import torch
+import warnings
 
-# Chord templates - 12 pitch classes for each chord type
-CHORD_TEMPLATES = {
-    # Major chords (root, major 3rd, perfect 5th)
-    'C': [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0],
-    'C#': [0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0],
-    'D': [0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0],
-    'D#': [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0],
-    'E': [0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1],
-    'F': [1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-    'F#': [0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0],
-    'G': [0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1],
-    'G#': [1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0],
-    'A': [0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0],
-    'A#': [0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0],
-    'B': [0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1],
-    
-    # Minor chords (root, minor 3rd, perfect 5th)
-    'Cm': [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
-    'C#m': [0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-    'Dm': [0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-    'D#m': [0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0],
-    'Em': [0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1],
-    'Fm': [1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0],
-    'F#m': [0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0],
-    'Gm': [0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0],
-    'G#m': [0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1],
-    'Am': [1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0],
-    'A#m': [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
-    'Bm': [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-    
-    # Dominant 7th chords
-    'C7': [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0],
-    'D7': [0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1],
-    'E7': [0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1],
-    'G7': [0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1],
-    'A7': [0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0],
-}
+warnings.filterwarnings('ignore')
 
-# Convert templates to numpy arrays
-for chord in CHORD_TEMPLATES:
-    CHORD_TEMPLATES[chord] = np.array(CHORD_TEMPLATES[chord], dtype=float)
-    # Normalize
-    CHORD_TEMPLATES[chord] /= np.linalg.norm(CHORD_TEMPLATES[chord])
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from btc_model import BTC_model
+from utils.hparams import HParams
+
+# Chord index to name mapping
+IDX2CHORD = ['C', 'C:min', 'C#', 'C#:min', 'D', 'D:min', 'D#', 'D#:min', 'E', 'E:min', 
+             'F', 'F:min', 'F#', 'F#:min', 'G', 'G:min', 'G#', 'G#:min', 'A', 'A:min', 
+             'A#', 'A#:min', 'B', 'B:min', 'N']
+
+# Device setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Global model instance
+_model = None
+_mean = None
+_std = None
+_config = None
 
 
-def match_chord(chroma: np.ndarray) -> Tuple[str, float]:
-    """Match a chroma vector to the best chord template."""
-    if np.sum(chroma) < 0.01:
-        return 'N/C', 0.0
+def format_chord_for_guitar(chord: str) -> str:
+    """Convert BTC chord notation to guitar-friendly format."""
+    if chord == 'N' or chord == 'X':
+        return 'N/C'
     
-    # Normalize chroma
-    chroma_norm = chroma / (np.linalg.norm(chroma) + 1e-6)
+    # Convert notation like "C:min" to "Cm", "C#:min" to "C#m"
+    chord = chord.replace(':min', 'm')
+    chord = chord.replace(':maj', '')
+    chord = chord.replace(':7', '7')
+    chord = chord.replace(':dim', 'dim')
+    chord = chord.replace(':aug', 'aug')
+    chord = chord.replace(':sus4', 'sus4')
+    chord = chord.replace(':sus2', 'sus2')
     
-    best_chord = 'N/C'
-    best_score = 0.0
+    # Handle flats - convert A# to Bb for common guitar usage
+    replacements = {
+        'A#': 'Bb', 'A#m': 'Bbm',
+        'D#': 'Eb', 'D#m': 'Ebm', 
+        'G#': 'Ab', 'G#m': 'Abm',
+    }
     
-    for chord_name, template in CHORD_TEMPLATES.items():
-        # Cosine similarity
-        score = np.dot(chroma_norm, template)
-        if score > best_score:
-            best_score = score
-            best_chord = chord_name
+    for old, new in replacements.items():
+        if chord == old:
+            return new
     
-    # Threshold - if score is too low, return N/C
-    if best_score < 0.5:
-        return 'N/C', best_score
+    return chord
+
+
+def load_model():
+    """Load the BTC model and weights."""
+    global _model, _mean, _std, _config
     
-    return best_chord, float(best_score)
+    if _model is not None:
+        return
+    
+    # Load config
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'run_config.yaml')
+    _config = HParams.load(config_path)
+    
+    # Load model
+    _model = BTC_model(config=_config.model).to(device)
+    
+    # Load weights
+    model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models', 'btc_model.pt')
+    if os.path.isfile(model_path):
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        _mean = checkpoint['mean']
+        _std = checkpoint['std']
+        _model.load_state_dict(checkpoint['model'])
+        _model.eval()
+        print(f"BTC model loaded successfully from {model_path}")
+    else:
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+
+def extract_features(audio_path: str) -> tuple:
+    """Extract CQT features from audio file."""
+    global _config
+    
+    # Load audio
+    y, sr = librosa.load(audio_path, sr=_config.mp3['song_hz'], mono=True)
+    duration = len(y) / sr
+    
+    # Extract CQT features in chunks
+    current_pos = 0
+    chunk_size = int(_config.mp3['song_hz'] * _config.mp3['inst_len'])
+    feature = None
+    
+    while current_pos + chunk_size < len(y):
+        chunk = y[current_pos:current_pos + chunk_size]
+        cqt = librosa.cqt(chunk, sr=sr, 
+                         n_bins=_config.feature['n_bins'],
+                         bins_per_octave=_config.feature['bins_per_octave'],
+                         hop_length=_config.feature['hop_length'])
+        if feature is None:
+            feature = cqt
+        else:
+            feature = np.concatenate((feature, cqt), axis=1)
+        current_pos += chunk_size
+    
+    # Process remaining audio
+    if current_pos < len(y):
+        remaining = y[current_pos:]
+        if len(remaining) > _config.feature['hop_length']:
+            cqt = librosa.cqt(remaining, sr=sr,
+                             n_bins=_config.feature['n_bins'],
+                             bins_per_octave=_config.feature['bins_per_octave'],
+                             hop_length=_config.feature['hop_length'])
+            if feature is None:
+                feature = cqt
+            else:
+                feature = np.concatenate((feature, cqt), axis=1)
+    
+    # Log magnitude
+    feature = np.log(np.abs(feature) + 1e-6)
+    
+    # Calculate time per feature frame
+    feature_per_second = _config.mp3['inst_len'] / _config.model['timestep']
+    
+    return feature, feature_per_second, duration
 
 
 def detect_key(chords: List[Dict]) -> str:
@@ -86,7 +143,7 @@ def detect_key(chords: List[Dict]) -> str:
             continue
         # Extract root note
         root = chord[0]
-        if len(chord) > 1 and chord[1] == '#':
+        if len(chord) > 1 and chord[1] in ['#', 'b']:
             root = chord[:2]
         chord_counts[root] = chord_counts.get(root, 0) + 1
     
@@ -96,85 +153,99 @@ def detect_key(chords: List[Dict]) -> str:
 
 
 async def analyze_audio(file_path: str) -> Dict[str, Any]:
-    """Analyze audio file and detect chords using chromagram analysis."""
+    """Analyze audio file and detect chords using BTC Transformer model."""
+    global _model, _mean, _std, _config
     
-    # Load audio
-    y, sr = librosa.load(file_path, sr=22050, mono=True)
-    duration = librosa.get_duration(y=y, sr=sr)
+    # Load model if not already loaded
+    load_model()
     
-    # Parameters for analysis
-    hop_length = 512
-    frame_length = 2048
+    # Extract features
+    feature, time_unit, duration = extract_features(file_path)
     
-    # Extract chromagram
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+    # Transpose and normalize
+    feature = feature.T
+    feature = (feature - _mean) / _std
     
-    # Segment into chunks (about 0.5 seconds each)
-    chunk_frames = int(0.5 * sr / hop_length)
+    # Pad to timestep boundary
+    n_timestep = _config.model['timestep']
+    num_pad = n_timestep - (feature.shape[0] % n_timestep)
+    if num_pad < n_timestep:
+        feature = np.pad(feature, ((0, num_pad), (0, 0)), mode="constant", constant_values=0)
     
+    num_instances = feature.shape[0] // n_timestep
+    
+    # Run inference
+    raw_chords = []
+    start_time = 0.0
+    prev_chord = None
+    
+    with torch.no_grad():
+        _model.eval()
+        feature_tensor = torch.tensor(feature, dtype=torch.float32).unsqueeze(0).to(device)
+        
+        for t in range(num_instances):
+            chunk = feature_tensor[:, n_timestep * t:n_timestep * (t + 1), :]
+            encoder_output, _ = _model.self_attn_layers(chunk)
+            prediction, _ = _model.output_layer(encoder_output)
+            prediction = prediction.squeeze()
+            
+            for i in range(n_timestep):
+                current_time = time_unit * (n_timestep * t + i)
+                chord_idx = prediction[i].item()
+                
+                if prev_chord is None:
+                    prev_chord = chord_idx
+                    start_time = current_time
+                    continue
+                
+                if chord_idx != prev_chord:
+                    # Save previous chord
+                    chord_name = IDX2CHORD[prev_chord] if prev_chord < len(IDX2CHORD) else 'N'
+                    raw_chords.append({
+                        'start': start_time,
+                        'end': current_time,
+                        'chord': chord_name
+                    })
+                    start_time = current_time
+                    prev_chord = chord_idx
+                
+                # Handle last segment
+                if t == num_instances - 1 and i + num_pad >= n_timestep:
+                    chord_name = IDX2CHORD[prev_chord] if prev_chord < len(IDX2CHORD) else 'N'
+                    raw_chords.append({
+                        'start': start_time,
+                        'end': duration,
+                        'chord': chord_name
+                    })
+                    break
+    
+    # Post-process chords
     chords = []
-    n_frames = chroma.shape[1]
-    
-    current_chord = None
-    current_start = 0.0
-    
-    for i in range(0, n_frames, chunk_frames):
-        # Get average chroma for this chunk
-        end_idx = min(i + chunk_frames, n_frames)
-        chunk_chroma = np.mean(chroma[:, i:end_idx], axis=1)
+    for c in raw_chords:
+        chord_name = format_chord_for_guitar(c['chord'])
         
-        # Get time
-        start_time = i * hop_length / sr
-        end_time = end_idx * hop_length / sr
-        
-        # Match chord
-        chord_name, confidence = match_chord(chunk_chroma)
+        # Skip very short N/C chords
+        chord_duration = c['end'] - c['start']
+        if chord_name == 'N/C' and chord_duration < 0.5:
+            continue
         
         # Merge with previous if same chord
-        if current_chord is not None and current_chord == chord_name:
-            # Extend current chord
-            pass
+        if chords and chords[-1]['chord'] == chord_name:
+            chords[-1]['endTime'] = c['end']
         else:
-            # Save previous chord
-            if current_chord is not None:
-                chords.append({
-                    'chord': current_chord,
-                    'startTime': current_start,
-                    'endTime': start_time,
-                    'confidence': 0.75,
-                    'notes': []
-                })
-            current_chord = chord_name
-            current_start = start_time
-    
-    # Add last chord
-    if current_chord is not None:
-        chords.append({
-            'chord': current_chord,
-            'startTime': current_start,
-            'endTime': duration,
-            'confidence': 0.75,
-            'notes': []
-        })
-    
-    # Post-process: filter short N/C segments and merge
-    filtered_chords = []
-    for c in chords:
-        dur = c['endTime'] - c['startTime']
-        # Skip very short N/C
-        if c['chord'] == 'N/C' and dur < 1.0:
-            continue
-        # Merge with previous if same
-        if filtered_chords and filtered_chords[-1]['chord'] == c['chord']:
-            filtered_chords[-1]['endTime'] = c['endTime']
-        else:
-            filtered_chords.append(c)
+            chords.append({
+                'chord': chord_name,
+                'startTime': c['start'],
+                'endTime': c['end'],
+                'confidence': 0.85,
+                'notes': []
+            })
     
     # Detect key
-    detected_key = detect_key(filtered_chords)
+    detected_key = detect_key(chords)
     
     return {
-        'chords': filtered_chords,
+        'chords': chords,
         'duration': duration,
         'key': detected_key
     }
